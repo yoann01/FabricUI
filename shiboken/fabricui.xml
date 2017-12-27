@@ -1,0 +1,84 @@
+<?xml  version="1.0"?>
+<typesystem package="FabricUI">
+
+  <primitive-type name="std::string"/>
+
+  <load-typesystem name="typesystem_core.xml" generate="no"/>
+  <load-typesystem name="typesystem_gui_common.xml" generate="no"/>
+  <load-typesystem name="typesystem_gui.xml" generate="no"/>
+  <load-typesystem name="typesystem_opengl.xml" generate="no"/>
+
+  <load-typesystem name="fabricui_core.xml" generate="yes"/>
+
+  <namespace-type name="FabricUI" generate="no">
+    <load-typesystem name="fabricui_commands.xml" generate="yes"/>
+    <load-typesystem name="fabricui_dfg.xml" generate="yes"/>
+    <load-typesystem name="fabricui_viewports.xml" generate="yes"/>
+    <load-typesystem name="fabricui_timeline.xml" generate="yes"/>
+ 
+    <namespace-type name="GraphView" generate="yes">
+      <object-type name="Node" />
+      <object-type name="InstBlock" />
+      <object-type name="Graph" />
+      <object-type name="Controller">
+        <modify-function signature="Controller()" remove="all" />
+        <modify-function signature="Controller(Graph *)" remove="all" />
+      </object-type>
+    </namespace-type>
+
+    <load-typesystem name="fabricui_application.xml" generate="yes"/>
+    <load-typesystem name="fabricui_style.xml" generate="yes"/>
+    <load-typesystem name="fabricui_menus.xml" generate="yes"/>
+    <load-typesystem name="fabricui_dialog.xml" generate="yes"/>
+    <load-typesystem name="fabricui_tools.xml" generate="yes"/>
+    <load-typesystem name="fabricui_actions.xml" generate="yes"/>
+    <load-typesystem name="fabricui_modelitems.xml" generate="yes"/>
+    <load-typesystem name="fabricui_valueeditor.xml" generate="yes"/>
+    <load-typesystem name="fabricui_optionseditor.xml" generate="yes"/>
+    <load-typesystem name="fabricui_scenehub.xml" generate="yes"/>
+
+    <namespace-type name="_Test" generate="yes">
+      <object-type name="RTValCrash" />
+    </namespace-type>
+     
+    <namespace-type name="Util" generate="yes">
+      <extra-includes>
+        <include file-name="GetFilenameForFileURL.h" location="global"/>
+      </extra-includes>
+      <function signature="GetFilenameForFileURL(QUrl)"/>
+      <object-type name="QTSignalBlocker"/>
+      <load-typesystem name="fabricui_util.xml" generate="yes"/>
+    </namespace-type>
+  </namespace-type>
+
+  <namespace-type name="FabricServices" generate="no">
+    <namespace-type name="ASTWrapper" generate="no">
+      <object-type name="KLDeclContainer">
+        <modify-function signature="KLDeclContainer()" remove="all" />
+      </object-type>
+      <object-type name="KLASTManager" copyable="false">
+        <modify-function signature="KLASTManager(const FabricCore::Client *)">
+          <modify-argument index="1">
+            <replace-type modified-type="PyObject"/>
+          </modify-argument>
+          <inject-code class="target" position="beginning">
+            FabricCore::Client *client_ptr = 0;
+
+            <insert-template name="to_cpp_Client">
+              <replace from="%INPUT" to="%PYARG_1"/>
+              <replace from="%OUTPUT" to="client_ptr"/>
+              <replace from="%DEREF" to=""/>
+            </insert-template>
+
+            if (!PyErr_Occurred()) {
+             %0 = new %TYPE(client_ptr);
+            }
+          </inject-code>
+        </modify-function>
+      </object-type>
+    </namespace-type>
+  </namespace-type>
+
+  <function signature="FabricUI_HandleLicenseData(QWidget*,FabricCore::Client&amp;,FTL::StrRef,bool)" rename="HandleLicenseData"/>
+
+</typesystem>

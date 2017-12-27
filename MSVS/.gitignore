@@ -1,0 +1,3 @@
+# call "scons MSVS" from FabricUI/ on Windows to generate files here
+*
+!.gitignore

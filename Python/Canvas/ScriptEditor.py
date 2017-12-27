@@ -1,0 +1,716 @@
+"""
+The ScriptEditor is where Python code may be written and executed in the
+context of the current Canvas scene. All Canvas commands that are
+executed through the UI (e.g. creating a node, moving one, editing a
+port, etc.) will also show up in the ScriptEditor as Python code so that
+users can see exactly what Canvas is doing, and to assist in reproducing
+issues that were initially triggered through the UI.
+"""
+
+import sys, os, platform, traceback
+from PySide import QtCore, QtGui
+from FabricEngine.Canvas.BindingWrapper import BindingWrapper
+from FabricEngine.Canvas.LogWidget import LogWidget
+from FabricEngine.Canvas.LoadFabricStyleSheet import LoadFabricStyleSheet
+from FabricEngine.Canvas.PythonHighlighter import PythonHighlighter
+from FabricEngine.FabricUI import DFG, Actions
+from FabricEngine.Canvas.Commands.CommandRegistry import *
+from FabricEngine.Canvas.Commands.CommandManager import *
+
+class LogStd:
+
+    def __init__(self, log):
+        self._log = log
+
+    def _validate(self):
+        if not self._log:
+            raise ValueError("I/O operation on closed file")
+
+    def writelines(self, ss):
+        self._validate()
+        for s in ss:
+            self.write(s)
+
+    def close(self):
+        self._log = None
+
+    def flush(self):
+        self._validate()
+
+    def _raiseNotOpenForReading(self):
+        raise IOError('File not open for reading')
+
+    def next(self):
+        self._raiseNotOpenForReading()
+
+    def read(self, size=-1):
+        self._raiseNotOpenForReading()
+
+    def readline(self, sizehint=-1):
+        self._raiseNotOpenForReading()
+
+    def xreadlines(self):
+        self._raiseNotOpenForReading()
+
+    def seek(self, offset, whence=None):
+        pass
+
+    def tell(self):
+        return 0
+
+    def truncate(self, size=-1):
+        pass
+
+class LogStdOut(LogStd):
+
+    def __init__(self, log):
+        LogStd.__init__(self, log)
+
+    def write(self, s):
+        self._log.appendComment(s)
+
+class LogStdErr(LogStd):
+
+    def __init__(self, log):
+        LogStd.__init__(self, log)
+
+    def write(self, s):
+        self._log.appendException(s)
+
+class ScriptEditor(QtGui.QWidget):
+
+    class CmdEditor(QtGui.QPlainTextEdit):
+
+        returnPressed = QtCore.Signal()
+        linesSelected = QtCore.Signal(int, int)
+
+        class LineNumberArea(QtGui.QWidget):
+
+            def __init__(self, cmdEditor):
+                QtGui.QWidget.__init__(self, cmdEditor)
+                self.__cmdEditor = cmdEditor
+                
+                self.setObjectName("LineNumberArea")
+
+            def sizeHint(self):
+                return QtCore.QSize(self.__cmdEditor.lineNumberAreaWidth(), 0)
+
+            def paintEvent(self, event):
+                self.__cmdEditor.lineNumberAreaPaintEvent(event)
+  
+            def mousePressEvent(self, event):
+                self.__cmdEditor.lineNumberAreaMousePressEvent(event)
+  
+            def mouseMoveEvent(self, event):
+                self.__cmdEditor.lineNumberAreaMouseMoveEvent(event)
+  
+            def mouseReleaseEvent(self, event):
+                self.__cmdEditor.lineNumberAreaMouseReleaseEvent(event)
+  
+        def __init__(self, font):
+            QtGui.QPlainTextEdit.__init__(self)
+
+            self.setObjectName("ScriptEditorCmdEditor")
+
+            self.__highlighter = PythonHighlighter(self.document())
+
+            lineNumberArea = self.LineNumberArea(self)
+            self.__lineNumberArea = lineNumberArea
+
+            self.setFont(font)
+            self.setTabStopWidth(4 * self.fontMetrics().width(' '))
+
+            def updateLineNumberAreaWidth(newBlockCount):
+                self.setViewportMargins(self.lineNumberAreaWidth(), 0, 0, 0)
+            self.blockCountChanged.connect(updateLineNumberAreaWidth)
+
+            def updateLineNumberArea(rect, dy):
+                if dy != 0:
+                    lineNumberArea.scroll(0, dy)
+                else:
+                    lineNumberArea.update(0, rect.y(), lineNumberArea.width(), rect.height())
+
+                if rect.contains(self.viewport().rect()):
+                    updateLineNumberAreaWidth(0)
+            self.updateRequest.connect(updateLineNumberArea)
+
+            updateLineNumberAreaWidth(0)
+
+        def resizeEvent(self, event):
+            QtGui.QWidget.resizeEvent(self, event)
+            cr = self.contentsRect()
+            self.__lineNumberArea.setGeometry(
+              QtCore.QRect(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height())
+              )
+
+        def lineNumberAreaWidth(self):
+            digits = 1
+            max = self.blockCount()
+            if max < 1:
+                max = 1
+            while max >= 10:
+                max = max / 10
+                digits = digits + 1
+            if digits < 3:
+                digits = 3
+            return 3 + self.fontMetrics().width('9') * digits + 5
+
+        def lineNumberAreaMousePressEvent(self, event):
+            firstBlock = self.firstVisibleBlock()
+            blockHeight = self.blockBoundingRect(firstBlock).height()
+            self.__mousePressStartBlockNumber = int(event.y() / blockHeight) + firstBlock.blockNumber()
+            self.linesSelected.emit(self.__mousePressStartBlockNumber, self.__mousePressStartBlockNumber)
+
+        def lineNumberAreaMouseMoveEvent(self, event):
+            firstBlock = self.firstVisibleBlock()
+            blockHeight = self.blockBoundingRect(firstBlock).height()
+            blockNumber = int(event.y() / blockHeight) + firstBlock.blockNumber()
+            self.linesSelected.emit(self.__mousePressStartBlockNumber, blockNumber)
+
+        def lineNumberAreaMouseReleaseEvent(self, event):
+            pass
+
+        def lineNumberAreaPaintEvent(self, event):
+            lineNumberArea = self.__lineNumberArea
+            painter = QtGui.QPainter(lineNumberArea)
+            painter.fillRect(event.rect(), QtCore.Qt.lightGray)
+            block = self.firstVisibleBlock()
+            blockNumber = block.blockNumber()
+            top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+            bottom = top + int(self.blockBoundingRect(block).height())
+            painter.setFont(self.font())
+            while block.isValid() and top <= event.rect().bottom():
+                if block.isVisible() and bottom >= event.rect().top():
+                    blockNumberText = str(blockNumber + 1)
+                    painter.setPen(QtCore.Qt.black)
+                    painter.drawText(
+                        0, top,
+                        lineNumberArea.width() - 3, self.fontMetrics().height(),
+                        QtCore.Qt.AlignRight, blockNumberText
+                        )
+                block = block.next()
+                top = bottom
+                bottom = top + int(self.blockBoundingRect(block).height())
+                blockNumber = blockNumber + 1
+  
+        def leadingSpaceCount(self, tb):
+            s = tb.text()
+            result = 0
+            for c in s:
+                if c == " ":
+                    result += 1
+                elif c == '\t':
+                    result = int((result + 4)/4) * 4
+                else:
+                    break
+            return result
+
+        def isInLeadingSpace(self, tc):
+            tb = tc.block()
+            s = tb.text()
+            for i in range(0, tc.positionInBlock()):
+                if not s[i] in [" ", "\t"]:
+                    return False
+            return True
+
+        def keyPressEvent(self, event):
+            # print "event.key() = %s" % str(event.key())
+            if event.key() == QtCore.Qt.Key_Return or event.key() == QtCore.Qt.Key_Enter:
+                if event.modifiers() == QtCore.Qt.ControlModifier:
+                    event.ignore()
+                    return
+            elif event.key() == QtCore.Qt.Key_Tab:
+                if (event.modifiers() & ~QtCore.Qt.ShiftModifier) == 0:
+                    tc = self.textCursor()
+                    if tc.hasSelection() or self.isInLeadingSpace(tc):
+                        self.indent()
+                    else:
+                        self.insertTab()
+                    event.accept()
+                    return
+            elif event.key() == QtCore.Qt.Key_Backtab:
+                if (event.modifiers() & ~QtCore.Qt.ShiftModifier) == 0:
+                    tc = self.textCursor()
+                    if tc.hasSelection() or self.isInLeadingSpace(tc):
+                        self.exdent()
+                    else:
+                        self.insertTab()
+                    event.accept()
+                    return
+            elif event.key() == QtCore.Qt.Key_Backspace:
+                if event.modifiers() == QtCore.Qt.NoModifier:
+                    tc = self.textCursor()
+                    if not tc.hasSelection() and not tc.atBlockStart() and self.isInLeadingSpace(tc):
+                        self.exdent()
+                        event.accept()
+                        return
+            elif event.key() == QtCore.Qt.Key_BracketLeft:
+                if event.modifiers() == QtCore.Qt.ControlModifier:
+                    self.exdent()
+                    event.accept()
+                    return
+            elif event.key() == QtCore.Qt.Key_BracketRight:
+                if event.modifiers() == QtCore.Qt.ControlModifier:
+                    self.indent()
+                    event.accept()
+                    return
+            QtGui.QPlainTextEdit.keyPressEvent(self, event)
+
+        def insertTab(self):
+            tc = self.textCursor()
+            try:
+                tc.beginEditBlock()
+                tb = tc.block()
+                s = tb.text()
+                leadingChars = 0
+                for i in range(0, tc.positionInBlock()):
+                    if s[i] == '\t':
+                        leadingChars = int((leadingChars + 4) / 4) * 4
+                    else:
+                        leadingChars += 1
+                spacesToAdd = int((leadingChars + 4) / 4) * 4 - leadingChars
+                tc.insertText(' '*spacesToAdd)
+                self.setTextCursor(tc)
+            finally:
+                tc.endEditBlock()
+
+        def indent(self):
+            otc = self.textCursor()
+            tc = self.textCursor()
+            try:
+                tc.beginEditBlock()
+                td = self.document()
+                sp = tc.selectionStart()
+                ep = tc.selectionEnd()
+                tc.setPosition(sp)
+                sbn = tc.blockNumber()
+                tc.setPosition(ep)
+                ebn = tc.blockNumber()
+                if tc.positionInBlock() == 0 and ebn > sbn:
+                    ebn -= 1
+                for bn in range(sbn, ebn+1):
+                    tb = td.findBlockByNumber(bn)
+                    oldLeadingSpaceCount = self.leadingSpaceCount(tb)
+                    newLeadingSpaceCount = int((oldLeadingSpaceCount + 4) / 4) * 4
+                    tc.setPosition(tb.position())
+                    tc.setPosition(tb.position() + oldLeadingSpaceCount, tc.KeepAnchor)
+                    tc.insertText(' ' * newLeadingSpaceCount)
+                self.setTextCursor(otc)
+            finally:
+                tc.endEditBlock()
+
+        def exdent(self):
+            otc = self.textCursor()
+            tc = self.textCursor()
+            try:
+                tc.beginEditBlock()
+                td = self.document()
+                sp = tc.selectionStart()
+                ep = tc.selectionEnd()
+                tc.setPosition(sp)
+                sbn = tc.blockNumber()
+                tc.setPosition(ep)
+                ebn = tc.blockNumber()
+                if tc.positionInBlock() == 0 and ebn > sbn:
+                    ebn -= 1
+                for bn in range(sbn, ebn+1):
+                    tb = td.findBlockByNumber(bn)
+                    s = tb.text()
+                    oldLeadingSpaceCount = self.leadingSpaceCount(tb)
+                    if oldLeadingSpaceCount > 4:
+                        newLeadingSpaceCount = int((oldLeadingSpaceCount - 3) / 4) * 4
+                    else:
+                        newLeadingSpaceCount = 0
+                    tc.setPosition(tb.position())
+                    tc.setPosition(tb.position() + oldLeadingSpaceCount, tc.KeepAnchor)
+                    tc.insertText(' ' * newLeadingSpaceCount)
+                self.setTextCursor(otc)
+            finally:
+                tc.endEditBlock()
+
+    titleDataChanged = QtCore.Signal(str, bool)
+
+    def __init__(self, client, binding, qUndoStack, dfgLogWidget, settings, canvasWindow, config):
+        QtGui.QWidget.__init__(self)
+
+        self.setObjectName('ScriptEditorWidget')
+        self.setStyleSheet(LoadFabricStyleSheet("FabricUI.qss"))
+
+        self.__undoStackIndex = qUndoStack.index()
+        qUndoStack.indexChanged.connect(self.undoStackIndexChanged)
+        self.__qUndoStack = qUndoStack
+        self._echoStackIndexChanges = True
+        self._isExecuting = False
+
+        self.eval_globals = {
+            "binding": BindingWrapper(client, binding, qUndoStack),
+            "newGraph": canvasWindow.onNewGraph,
+            "newScript": self.newScript,
+            "loadScript": self.loadScript,
+            "bindingUtils": DFG.DFGBindingUtils(),
+            "Commands" : sys.modules["Commands"]
+            }
+         
+        self.dfgLogWidget = dfgLogWidget
+
+        self.settings = settings
+
+        self.log = LogWidget()
+        self.log.setFont(config.fixedFont)
+
+        self.filename = ""
+
+        self.stdout = LogStdOut(self.log)
+        self.stderr = LogStdErr(self.log)
+
+        self.cmd = self.CmdEditor(config.fixedFont)
+        self.cmd.returnPressed.connect(self.execute)
+        self.cmd.linesSelected.connect(self.onLinesSelected)
+
+        splitter = QtGui.QSplitter(QtCore.Qt.Vertical)
+        splitter.setContentsMargins(0,0,0,0)
+        splitter.addWidget(self.cmd)
+        splitter.addWidget(self.log)
+
+        newAction = NewScriptAction(self)
+        
+        openAction = OpenScriptAction(self)
+  
+        self.saveAction = SaveScriptAction(self)
+     
+        self.cmd.modificationChanged.connect(self.onModificationChanged)
+
+        saveAsAction = SaveScriptAsAction(self)
+   
+        executeAction = ExecuteScriptAction(self)
+        self.cmd.addAction(executeAction)
+
+        self.echoCommandsAction = QtGui.QAction("Echo Commands", self)
+        self.echoCommandsAction.setCheckable(True)
+        self.echoCommandsAction.setChecked(bool(self.settings.value("scriptEditor/echoCommands", True)))
+        self.echoCommandsAction.toggled.connect(self.echoCommandsToggled)
+
+        toolBar = QtGui.QToolBar()
+        toolBar.addAction(newAction)
+        toolBar.addAction(openAction)
+        toolBar.addAction(self.saveAction)
+        toolBar.addAction(saveAsAction)
+        toolBar.addSeparator()
+        toolBar.addAction(executeAction)
+        toolBar.addSeparator()
+        toolBar.addAction(self.echoCommandsAction)
+        toolBar.addAction(self.log.clearAction("Clear Output"))
+
+        layout = QtGui.QVBoxLayout()
+        layout.setContentsMargins(0,0,0,0)
+        layout.addWidget(toolBar)
+        layout.addWidget(splitter)
+
+        self.setContentsMargins(0,0,0,0)
+        self.setLayout(layout)
+
+    def setTimeLineGlobal(self, timeLine):
+        self.eval_globals["timeLine"] = timeLine
+
+    def setDFGControllerGlobal(self, dfgController):
+        self.eval_globals["controller"] = dfgController
+        
+    def onLinesSelected(self, startLineNum, endLineNum):
+        startTextBlock = self.cmd.document().findBlockByLineNumber(startLineNum)
+        endTextBlock = self.cmd.document().findBlockByLineNumber(endLineNum)
+        textCursor = self.cmd.textCursor()
+        if startLineNum > endLineNum:
+            textCursor.setPosition(startTextBlock.position() + startTextBlock.length())
+            textCursor.setPosition(endTextBlock.position(), textCursor.KeepAnchor)
+        else:
+            textCursor.setPosition(startTextBlock.position())
+            textCursor.setPosition(endTextBlock.position() + endTextBlock.length(), textCursor.KeepAnchor)
+        self.cmd.setTextCursor(textCursor)
+
+    def undoStackIndexChanged(self, index):
+        if self._echoStackIndexChanges and self.echoCommandsAction.isChecked():
+            if index < self.__undoStackIndex:
+                for i in range(self.__undoStackIndex-1, index-1, -1):
+                    s = self.__qUndoStack.text(i)
+                    if s:
+                        self.log.appendCommand("# [UNDO] %s\n" % s)
+            else:
+                for i in range(self.__undoStackIndex, index, 1):
+                    s = self.__qUndoStack.text(i)
+                    if s:
+                        self.log.appendCommand("# [REDO] %s\n" % s)
+        self.__undoStackIndex = index
+
+    def echoCommandsToggled(self, state):
+        self.settings.setValue("scriptEditor/echoCommands", state)
+
+    def updateBinding(self, binding):
+        prev = self.eval_globals['binding']
+        self.eval_globals['binding'] = BindingWrapper(prev.client, binding, prev.qUndoStack)
+
+    def onModificationChanged(self, modification):
+        textDocument = self.cmd.document()
+        self.saveAction.setEnabled(
+            not textDocument.isEmpty() and textDocument.isModified() and len(self.filename) > 0
+            )
+        self.titleDataChanged.emit(self.filename, modification)
+
+    def checkUnsavedChanges(self):
+        textDocument = self.cmd.document()
+        if textDocument.isModified() and not textDocument.isEmpty():
+            msgBox = QtGui.QMessageBox(self)
+            msgBox.setWindowTitle("Script Editor")
+            msgBox.setText("Do you want to save your Python script?")
+            msgBox.setInformativeText(
+                "Your changes will be lost if you don't save them.")
+            msgBox.setStandardButtons(QtGui.QMessageBox.Save |
+                                      QtGui.QMessageBox.Discard |
+                                      QtGui.QMessageBox.Cancel)
+            msgBox.setDefaultButton(QtGui.QMessageBox.Save)
+            result = msgBox.exec_()
+            if result == QtGui.QMessageBox.Cancel:
+                return False
+            if result == QtGui.QMessageBox.Save:
+                return self.save()
+        return True
+
+    def newScript(self):
+        if not self.checkUnsavedChanges():
+            return False
+        self.filename = ""
+        textDocument = self.cmd.document()
+        textDocument.setPlainText("")
+        textDocument.setModified(False)
+        self.titleDataChanged.emit("", False)
+        return True
+
+    def open(self):
+        if not self.checkUnsavedChanges():
+            return False
+        lastFolder = str(self.settings.value("scriptEditor/lastFolder"))
+        filename, _ = QtGui.QFileDialog.getOpenFileName(
+            self, "Open Python Script", lastFolder, "*.py"
+            )
+        filename = str(filename)
+        if len(filename) == 0:
+            return False
+        return self.loadScript(filename)
+
+    def loadScript(self, filename):
+        textDocument = self.cmd.document()
+        try:
+            with open(filename, "r") as fh:
+                textDocument.setPlainText(fh.read())
+            textDocument.setModified(False)
+            self.filename = filename
+            self.titleDataChanged.emit(filename, False)
+            return True
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            sys.stderr.writelines(
+                traceback.format_exception(exc_type, exc_value, exc_traceback)
+                )
+            return False
+
+    def save(self):
+        if not self.filename:
+            return self.saveAs()
+        else:
+            with open(self.filename, "w") as fh:
+                fh.write(self.cmd.toPlainText())
+            self.cmd.document().setModified(False)
+            return True
+
+    def saveAs(self):
+        filename = self.filename
+        if not filename:
+            filename = str(self.settings.value("scriptEditor/lastFolder"))
+        filename, _ = QtGui.QFileDialog.getSaveFileName(
+            self, "Save Python Script", filename, "*.py"
+            )
+        if not filename:
+            return False
+        self.settings.setValue("scriptEditor/lastFolder", os.path.dirname(filename))
+        self.filename = filename
+        self.titleDataChanged.emit(filename, self.cmd.document().isModified())
+        return self.save()
+
+    def execute(self):
+        if self.cmd.textCursor().hasSelection():
+            code = self.cmd.textCursor().selectedText().replace(u"\u2029", "\n")
+        else:
+            code = self.cmd.toPlainText()
+
+        # Synchronize the KL-C++ registry so KL commands 
+        # can be created with 'named-arg' syntax. 
+        try:
+            GetCommandRegistry().synchronizeKL();
+        except Exception as e:    
+            print str(e)
+
+        self.exec_(code)
+
+        # Synchronize the KL-C++ registry so KL commands 
+        # can be created with 'named-arg' syntax. 
+        try:
+            GetCommandManager().synchronizeKL();
+        except Exception as e:    
+            print str(e)
+
+    def eval(self, code, replace = False):
+        if self.echoCommandsAction.isChecked():
+            self.log.appendCommand(code + "\n", replace)
+        oldEchoStackIndexChanges = self._echoStackIndexChanges
+        self._echoStackIndexChanges = False
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = self.stdout
+        sys.stderr = self.stderr
+        try:
+            result = eval(code, self.eval_globals)
+            if self.echoCommandsAction.isChecked() and result is not None:
+                self.log.appendCommand("Result: %s\n" % str(result), replace)
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            sys.stderr.writelines(
+                traceback.format_exception(exc_type, exc_value, exc_traceback)
+                )
+            result = None
+        sys.stderr = old_stderr
+        sys.stdout = old_stdout
+        self._echoStackIndexChanges = oldEchoStackIndexChanges
+        return result
+
+    def exec_(self, code, replace = False):
+        self._isExecuting = True
+        if self.echoCommandsAction.isChecked():
+            self.log.appendCommand(code + "\n", replace)
+        oldEchoStackIndexChanges = self._echoStackIndexChanges
+        self._echoStackIndexChanges = False
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = self.stdout
+        sys.stderr = self.stderr
+        try:
+            exec code in self.eval_globals
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            sys.stderr.writelines(
+                traceback.format_exception(exc_type, exc_value, exc_traceback)
+                )
+            sys.stderr = old_stderr
+            sys.stdout = old_stdout
+        self._echoStackIndexChanges = oldEchoStackIndexChanges
+        self._isExecuting = False
+
+    def logCommand(self, text, replace = False):
+        if self.echoCommandsAction.isChecked() and not self._isExecuting:
+            self.log.appendCommand(text + "\n", replace)
+    
+    def clear(self):
+        self.log.clear()
+        
+class BaseScriptEditorAction(Actions.BaseAction):
+ 
+    def __init__(self,
+        scriptEditor, 
+        name, 
+        text, 
+        shortcut, 
+        context = QtCore.Qt.WidgetWithChildrenShortcut, 
+        enable = True):
+
+        self.scriptEditor = scriptEditor
+        super(BaseScriptEditorAction, self).__init__(
+            scriptEditor, 
+            name, 
+            text, 
+            shortcut, 
+            context, 
+            enable)
+        self.scriptEditor.addAction(self)
+ 
+class NewScriptAction(BaseScriptEditorAction):
+ 
+    def __init__(self, scriptEditor):
+        super(NewScriptAction, self).__init__(
+            scriptEditor, 
+            "ScriptEditor.NewScriptAction", 
+            "New", 
+            QtGui.QKeySequence("Alt+Ctrl+N"))
+
+        self.setToolTip("New script (%s)" % self.shortcut().toString(QtGui.QKeySequence.NativeText))
+        
+    def onTriggered(self):
+        self.scriptEditor.newScript()
+
+class OpenScriptAction(BaseScriptEditorAction):
+ 
+    def __init__(self, scriptEditor):
+        super(OpenScriptAction, self).__init__(
+            scriptEditor, 
+            "ScriptEditor.OpenScriptAction", 
+            "Open", 
+            QtGui.QKeySequence("Alt+Ctrl+O"))
+        
+        self.setToolTip("Open script (%s)" % self.shortcut().toString(QtGui.QKeySequence.NativeText))
+
+    def onTriggered(self):
+        self.scriptEditor.open()
+ 
+class SaveScriptAction(BaseScriptEditorAction):
+ 
+    def __init__(self, scriptEditor):
+        super(SaveScriptAction, self).__init__(
+            scriptEditor, 
+            "ScriptEditor.SaveScriptAction", 
+            "Save", 
+            QtGui.QKeySequence("Alt+Ctrl+S"))
+        
+        self.setToolTip("Save script (%s)" % self.shortcut().toString(QtGui.QKeySequence.NativeText))
+
+    def onTriggered(self):
+        self.scriptEditor.save()
+ 
+class SaveScriptAsAction(BaseScriptEditorAction):
+ 
+    def __init__(self, scriptEditor):
+        super(SaveScriptAsAction, self).__init__(
+            scriptEditor, 
+            "ScriptEditor.SaveScriptAsAction", 
+            "Save As", 
+            QtGui.QKeySequence("Alt+Shift+Ctrl+S"))
+        
+        self.setToolTip("Save script As... (%s)" % self.shortcut().toString(QtGui.QKeySequence.NativeText))
+
+    def onTriggered(self):
+        self.scriptEditor.saveAs()
+
+class ExecuteScriptAction(BaseScriptEditorAction):
+ 
+    def __init__(self, scriptEditor):
+        super(ExecuteScriptAction, self).__init__(
+            scriptEditor, 
+            "ScriptEditor.ExecuteScriptAction", 
+            "Execute", 
+            [QtGui.QKeySequence("Ctrl+Return"), QtGui.QKeySequence("Ctrl+Enter")],
+            QtCore.Qt.WidgetWithChildrenShortcut)
+        
+        self.setToolTip("Execute script (%s)" % self.shortcut().toString(QtGui.QKeySequence.NativeText))
+ 
+    def onTriggered(self):
+        self.scriptEditor.execute()
+
+class EchoCommandAction(BaseScriptEditorAction):
+ 
+    def __init__(self, scriptEditor):
+        super(EchoCommandAction, self).__init__(
+            scriptEditor, 
+            "ScriptEditor.EchoCommandAction", 
+            "Echo Commands")
+
+        self.setCheckable(True)
+        self.setChecked(bool(self.settings.value("scriptEditor/echoCommands", True)))
+    
+    def onTriggered(self):
+        self.scriptEditor.echoCommandsToggled()

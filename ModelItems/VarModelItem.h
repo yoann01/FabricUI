@@ -1,0 +1,55 @@
+//
+// Copyright (c) 2010-2017 Fabric Software Inc. All rights reserved.
+//
+
+#ifndef FABRICUI_MODELITEMS_VARMODELITEM_H
+#define FABRICUI_MODELITEMS_VARMODELITEM_H
+
+#include <FabricUI/ModelItems/ItemModelItem.h>
+#include <FabricUI/ModelItems/VarItemMetadata.h>
+
+namespace FabricUI
+{
+
+  namespace ModelItems
+  {
+    //////////////////////////////////////////////////////////////////////////
+    // Access graph variables
+    class VarModelItem : public ItemModelItem
+    {
+    public:
+
+      VarModelItem(
+        DFG::DFGUICmdHandler *dfgUICmdHandler,
+        FabricCore::DFGBinding binding,
+        FTL::StrRef execPath,
+        FabricCore::DFGExec exec,
+        FTL::StrRef nodeName
+        );
+      ~VarModelItem();
+
+      virtual FabricUI::ValueEditor::BaseModelItem *
+      createChild( FTL::StrRef name ) /*override*/;
+
+      virtual QVariant getValue() /*override*/;
+
+      virtual FabricUI::ValueEditor::ItemMetadata *getMetadata() /*override*/;
+
+      bool shouldBeReadOnly() const;
+
+    protected:
+
+      virtual void setValue(
+        QVariant var,
+        bool commit,
+        QVariant valueAtInteractionBegin
+        ) /*override*/;
+
+    private:
+
+      VarItemMetadata m_metadata;
+    };
+  }
+}
+
+#endif // FABRICUI_MODELITEMS_VARMODELITEM_H
